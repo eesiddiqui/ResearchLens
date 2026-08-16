@@ -1,0 +1,19 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Generated embeddings
+data/embeddings/
+
+# Raw research papers
+data/raw/
+
+# VS Code settings
+.vscode/
+
+# Operating system files
+.DS_Store
+Thumbs.db
