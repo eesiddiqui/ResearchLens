@@ -1,0 +1,16 @@
+question_id,primary_papers,acceptable_papers
+Q01,p1_rag,"p1_rag;p6_rag_survey"
+Q02,p1_rag,"p1_rag;p6_rag_survey"
+Q03,p1_rag,"p1_rag;p6_rag_survey"
+Q04,p2_dpr,p2_dpr
+Q05,p2_dpr,p2_dpr
+Q06,p3_lost_middle,p3_lost_middle
+Q07,p3_lost_middle,p3_lost_middle
+Q08,p4_never_lost,p4_never_lost
+Q09,p5_rag_eval,"p5_rag_eval;p6_rag_survey"
+Q10,p5_rag_eval,p5_rag_eval
+Q11,p6_rag_survey,p6_rag_survey
+Q12,p7_realm,p7_realm
+Q13,p8_colbert,p8_colbert
+Q14,p2_dpr,"p2_dpr;p8_colbert;p7_realm"
+Q15,p6_rag_survey,"p6_rag_survey;p5_rag_eval;p2_dpr"
