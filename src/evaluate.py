@@ -1,10 +1,14 @@
 import csv
-import json
 from pathlib import Path
 
-import numpy as np
-
 from retrieve import load_datasets, retrieve
+from ground_truth import (
+    load_ground_truth,
+    load_ground_truth_pages,
+    validate_pages_against_papers,
+    is_paper_relevant,
+    is_page_relevant,
+)
 
 
 # ============================================================
@@ -13,17 +17,13 @@ from retrieve import load_datasets, retrieve
 
 QUESTIONS_FILE = Path("data/questions.csv")
 GROUND_TRUTH_FILE = Path("data/ground_truth.csv")
+GROUND_TRUTH_PAGES_FILE = Path("data/ground_truth_pages.csv")
 
 RESULTS_DIR = Path("data/evaluation")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-DETAILED_RESULTS_FILE = (
-    RESULTS_DIR / "retrieval_results.csv"
-)
-
-SUMMARY_RESULTS_FILE = (
-    RESULTS_DIR / "evaluation_summary.csv"
-)
+DETAILED_RESULTS_FILE = RESULTS_DIR / "retrieval_results.csv"
+SUMMARY_RESULTS_FILE = RESULTS_DIR / "evaluation_summary.csv"
 
 
 # ============================================================
@@ -43,12 +43,7 @@ def load_questions():
 
     questions = []
 
-    with open(
-        QUESTIONS_FILE,
-        "r",
-        encoding="utf-8-sig",
-        newline=""
-    ) as f:
+    with open(QUESTIONS_FILE, "r", encoding="utf-8-sig", newline="") as f:
 
         reader = csv.DictReader(f)
 
@@ -63,88 +58,16 @@ def load_questions():
 
 
 # ============================================================
-# Load ground truth
-# ============================================================
-
-def load_ground_truth():
-
-    ground_truth = {}
-
-    with open(
-        GROUND_TRUTH_FILE,
-        "r",
-        encoding="utf-8-sig",
-        newline=""
-    ) as f:
-
-        reader = csv.DictReader(f)
-
-        required_columns = {
-            "question_id",
-            "primary_papers",
-            "acceptable_papers"
-        }
-
-        missing = required_columns - set(
-            reader.fieldnames or []
-        )
-
-        if missing:
-
-            raise ValueError(
-                "ground_truth.csv is missing "
-                f"columns: {sorted(missing)}"
-            )
-
-        for row in reader:
-
-            question_id = (
-                row["question_id"].strip()
-            )
-
-            primary_papers = {
-                paper.strip()
-                for paper in
-                row["primary_papers"].split(";")
-                if paper.strip()
-            }
-
-            acceptable_papers = {
-                paper.strip()
-                for paper in
-                row["acceptable_papers"].split(";")
-                if paper.strip()
-            }
-
-            ground_truth[question_id] = {
-                "primary_papers": primary_papers,
-                "acceptable_papers": acceptable_papers
-            }
-
-    return ground_truth
-
-
-# ============================================================
 # Check ground truth
 # ============================================================
 
-def validate_inputs(
-    questions,
-    ground_truth
-):
+def validate_inputs(questions, ground_truth):
 
-    question_ids = {
-        q["question_id"]
-        for q in questions
-    }
+    question_ids = {q["question_id"] for q in questions}
 
-    ground_truth_ids = set(
-        ground_truth.keys()
-    )
+    ground_truth_ids = set(ground_truth.keys())
 
-    missing_ground_truth = (
-        question_ids - ground_truth_ids
-    )
+    missing_ground_truth = question_ids - ground_truth_ids
 
     if missing_ground_truth:
 
@@ -153,9 +76,7 @@ def validate_inputs(
             f"{sorted(missing_ground_truth)}"
         )
 
-    extra_ground_truth = (
-        ground_truth_ids - question_ids
-    )
+    extra_ground_truth = ground_truth_ids - question_ids
 
     if extra_ground_truth:
 
@@ -167,150 +88,90 @@ def validate_inputs(
 
 
 # ============================================================
-# Check whether a retrieved result is relevant
+# Metric helpers
+#
+# Every metric is computed TWICE per question:
+#
+#   *_paper -> the original, coarse notion of relevance: did we
+#              retrieve a chunk from the right PAPER?
+#
+#   *_page  -> the stricter, page-aware notion of relevance: did we
+#              retrieve a chunk from the right paper AND does that
+#              chunk's page span overlap the annotated answer pages?
+#
+# Page-aware metrics are the ones that should drive the chunk-size
+# conclusions; paper-level metrics are kept alongside them so we can
+# see how much the coarse metric was overstating retrieval quality.
 # ============================================================
 
-def is_relevant(
-    result,
-    acceptable_papers
-):
-
-    return (
-        result["paper_id"]
-        in acceptable_papers
-    )
-
-
-# ============================================================
-# Calculate Recall@K
-# ============================================================
-
-def calculate_recall(
-    results,
-    acceptable_papers,
-    k
-):
+def calculate_recall(results, relevance_fn, k):
 
     top_results = results[:k]
 
     for result in top_results:
 
-        if is_relevant(
-            result,
-            acceptable_papers
-        ):
-
+        if relevance_fn(result):
             return 1
 
     return 0
 
 
-# ============================================================
-# Calculate Reciprocal Rank
-# ============================================================
+def calculate_reciprocal_rank(results, relevance_fn):
 
-def calculate_reciprocal_rank(
-    results,
-    acceptable_papers
-):
+    for rank, result in enumerate(results, start=1):
 
-    for rank, result in enumerate(
-        results,
-        start=1
-    ):
-
-        if is_relevant(
-            result,
-            acceptable_papers
-        ):
-
+        if relevance_fn(result):
             return 1.0 / rank
 
     return 0.0
+
+
+def first_relevant_rank(results, relevance_fn):
+
+    for rank, result in enumerate(results, start=1):
+
+        if relevance_fn(result):
+            return rank
+
+    return ""
 
 
 # ============================================================
 # Evaluate one question
 # ============================================================
 
-def evaluate_question(
-    question,
-    datasets,
-    ground_truth
-):
+def evaluate_question(question, datasets, ground_truth, ground_truth_pages):
 
     question_id = question["question_id"]
 
     query = question["question"]
 
-    acceptable_papers = (
-        ground_truth[question_id]
-        ["acceptable_papers"]
-    )
+    acceptable_papers = ground_truth[question_id]["acceptable_papers"]
 
-    results = retrieve(
-        query,
-        datasets,
-        top_k=TOP_K
-    )
+    page_gt = ground_truth_pages.get(question_id, {})
 
-    recall_at_1 = calculate_recall(
-        results,
-        acceptable_papers,
-        1
-    )
+    results = retrieve(query, datasets, top_k=TOP_K)
 
-    recall_at_3 = calculate_recall(
-        results,
-        acceptable_papers,
-        3
-    )
+    paper_fn = lambda r: is_paper_relevant(r, acceptable_papers)
+    page_fn = lambda r: is_page_relevant(r, page_gt)
 
-    recall_at_5 = calculate_recall(
-        results,
-        acceptable_papers,
-        5
-    )
+    metrics = {}
 
-    reciprocal_rank = (
-        calculate_reciprocal_rank(
-            results,
-            acceptable_papers
-        )
-    )
+    for suffix, relevance_fn in (("paper", paper_fn), ("page", page_fn)):
 
-    first_relevant_rank = ""
-
-    for rank, result in enumerate(
-        results,
-        start=1
-    ):
-
-        if is_relevant(
-            result,
-            acceptable_papers
-        ):
-
-            first_relevant_rank = rank
-            break
+        metrics[f"recall_at_1_{suffix}"] = calculate_recall(results, relevance_fn, 1)
+        metrics[f"recall_at_3_{suffix}"] = calculate_recall(results, relevance_fn, 3)
+        metrics[f"recall_at_5_{suffix}"] = calculate_recall(results, relevance_fn, 5)
+        metrics[f"mrr_{suffix}"] = calculate_reciprocal_rank(results, relevance_fn)
+        metrics[f"first_relevant_rank_{suffix}"] = first_relevant_rank(results, relevance_fn)
 
     return {
         "question_id": question_id,
-
         "question": query,
-
-        "recall_at_1": recall_at_1,
-
-        "recall_at_3": recall_at_3,
-
-        "recall_at_5": recall_at_5,
-
-        "mrr": reciprocal_rank,
-
-        "first_relevant_rank":
-            first_relevant_rank,
-
-        "results": results
+        "results": results,
+        "metrics": metrics,
+        "paper_fn": paper_fn,
+        "page_fn": page_fn,
     }
 
 
@@ -318,9 +179,7 @@ def evaluate_question(
 # Save detailed retrieval results
 # ============================================================
 
-def save_detailed_results(
-    detailed_rows
-):
+def save_detailed_results(detailed_rows):
 
     fieldnames = [
         "question_id",
@@ -333,113 +192,73 @@ def save_detailed_results(
         "page_end",
         "word_count",
         "similarity",
-        "is_relevant",
+        "is_relevant_paper",
+        "is_relevant_page",
         "text"
     ]
 
-    with open(
-        DETAILED_RESULTS_FILE,
-        "w",
-        encoding="utf-8",
-        newline=""
-    ) as f:
+    with open(DETAILED_RESULTS_FILE, "w", encoding="utf-8", newline="") as f:
 
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
 
         writer.writeheader()
-
-        writer.writerows(
-            detailed_rows
-        )
+        writer.writerows(detailed_rows)
 
 
 # ============================================================
 # Save summary results
 # ============================================================
 
-def save_summary_results(
-    summary_rows
-):
+def save_summary_results(summary_rows):
 
     fieldnames = [
         "chunk_size",
         "num_questions",
-        "recall_at_1",
-        "recall_at_3",
-        "recall_at_5",
-        "mrr"
+        "recall_at_1_paper",
+        "recall_at_1_page",
+        "recall_at_3_paper",
+        "recall_at_3_page",
+        "recall_at_5_paper",
+        "recall_at_5_page",
+        "mrr_paper",
+        "mrr_page",
     ]
 
-    with open(
-        SUMMARY_RESULTS_FILE,
-        "w",
-        encoding="utf-8",
-        newline=""
-    ) as f:
+    with open(SUMMARY_RESULTS_FILE, "w", encoding="utf-8", newline="") as f:
 
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
 
         writer.writeheader()
-
-        writer.writerows(
-            summary_rows
-        )
+        writer.writerows(summary_rows)
 
 
 # ============================================================
 # Print individual question result
 # ============================================================
 
-def print_question_result(
-    question_id,
-    chunk_size,
-    result
-):
+def print_question_result(question_id, chunk_size, metrics):
+
+    print(f"\n{question_id} — {chunk_size}-word chunks")
 
     print(
-        f"\n{question_id} "
-        f"— {chunk_size}-word chunks"
+        f"Recall@1: paper={metrics['recall_at_1_paper']}  "
+        f"page={metrics['recall_at_1_page']}"
     )
 
     print(
-        f"Recall@1: "
-        f"{result['recall_at_1']}"
+        f"Recall@3: paper={metrics['recall_at_3_paper']}  "
+        f"page={metrics['recall_at_3_page']}"
     )
 
     print(
-        f"Recall@3: "
-        f"{result['recall_at_3']}"
+        f"Recall@5: paper={metrics['recall_at_5_paper']}  "
+        f"page={metrics['recall_at_5_page']}"
     )
 
     print(
-        f"Recall@5: "
-        f"{result['recall_at_5']}"
+        f"MRR: paper={metrics['mrr_paper']:.4f}  "
+        f"page={metrics['mrr_page']:.4f}"
     )
-
-    print(
-        f"MRR: "
-        f"{result['mrr']:.4f}"
-    )
-
-    if result["first_relevant_rank"]:
-
-        print(
-            "First relevant result: "
-            f"Rank {result['first_relevant_rank']}"
-        )
-
-    else:
-
-        print(
-            "First relevant result: "
-            "Not found in top 5"
-        )
 
 
 # ============================================================
@@ -448,55 +267,47 @@ def print_question_result(
 
 def main():
 
-    print(
-        "\n"
-        + "=" * 80
-    )
-
-    print(
-        "ResearchLens Retrieval Evaluation"
-    )
-
-    print(
-        "=" * 80
-    )
+    print("\n" + "=" * 80)
+    print("ResearchLens Retrieval Evaluation (paper-level + page-aware)")
+    print("=" * 80)
 
     # --------------------------------------------------------
-    # Load questions
+    # Load questions and both ground-truth files
     # --------------------------------------------------------
 
     questions = load_questions()
 
-    print(
-        f"\nLoaded {len(questions)} questions."
+    print(f"\nLoaded {len(questions)} questions.")
+
+    ground_truth = load_ground_truth(GROUND_TRUTH_FILE)
+
+    print(f"Loaded {len(ground_truth)} paper-level ground-truth entries.")
+
+    ground_truth_pages = load_ground_truth_pages(GROUND_TRUTH_PAGES_FILE)
+
+    print(f"Loaded page-aware ground truth for {len(ground_truth_pages)} questions.")
+
+    validate_inputs(questions, ground_truth)
+
+    consistency_problems = validate_pages_against_papers(
+        ground_truth, ground_truth_pages
     )
 
-    # --------------------------------------------------------
-    # Load ground truth
-    # --------------------------------------------------------
+    if consistency_problems:
 
-    ground_truth = load_ground_truth()
+        print(
+            "\nWARNING: ground_truth.csv and ground_truth_pages.csv "
+            "are out of sync:"
+        )
 
-    print(
-        f"Loaded {len(ground_truth)} "
-        "ground-truth entries."
-    )
-
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
-
-    validate_inputs(
-        questions,
-        ground_truth
-    )
+        for problem in consistency_problems:
+            print(" -", problem)
 
     # --------------------------------------------------------
     # Storage
     # --------------------------------------------------------
 
     all_summary_rows = []
-
     all_detailed_rows = []
 
     # --------------------------------------------------------
@@ -505,151 +316,49 @@ def main():
 
     for chunk_size in CHUNK_SIZES:
 
-        print(
-            "\n"
-            + "=" * 80
-        )
+        print("\n" + "=" * 80)
+        print(f"EVALUATING {chunk_size}-WORD CHUNKS")
+        print("=" * 80)
 
-        print(
-            f"EVALUATING "
-            f"{chunk_size}-WORD CHUNKS"
-        )
+        datasets = load_datasets(chunk_size)
 
-        print(
-            "=" * 80
-        )
+        total_chunks = sum(len(dataset["chunks"]) for dataset in datasets)
 
-        # ----------------------------------------------------
-        # Load datasets
-        # ----------------------------------------------------
+        print(f"Loaded {len(datasets)} papers.")
+        print(f"Total chunks: {total_chunks}")
 
-        datasets = load_datasets(
-            chunk_size
-        )
-
-        total_chunks = sum(
-            len(dataset["chunks"])
-            for dataset in datasets
-        )
-
-        print(
-            f"Loaded {len(datasets)} papers."
-        )
-
-        print(
-            f"Total chunks: {total_chunks}"
-        )
-
-        # ----------------------------------------------------
-        # Per-question metric storage
-        # ----------------------------------------------------
-
-        recall_1_values = []
-        recall_3_values = []
-        recall_5_values = []
-        mrr_values = []
-
-        # ----------------------------------------------------
-        # Evaluate every question
-        # ----------------------------------------------------
+        per_question_metrics = []
 
         for question in questions:
 
-            result = evaluate_question(
-                question,
-                datasets,
-                ground_truth
+            evaluated = evaluate_question(
+                question, datasets, ground_truth, ground_truth_pages
             )
 
-            question_id = (
-                question["question_id"]
-            )
+            question_id = evaluated["question_id"]
+            metrics = evaluated["metrics"]
 
-            # ------------------------------------------------
-            # Store metrics
-            # ------------------------------------------------
+            per_question_metrics.append(metrics)
 
-            recall_1_values.append(
-                result["recall_at_1"]
-            )
+            print_question_result(question_id, chunk_size, metrics)
 
-            recall_3_values.append(
-                result["recall_at_3"]
-            )
-
-            recall_5_values.append(
-                result["recall_at_5"]
-            )
-
-            mrr_values.append(
-                result["mrr"]
-            )
-
-            # ------------------------------------------------
-            # Print result
-            # ------------------------------------------------
-
-            print_question_result(
-                question_id,
-                chunk_size,
-                result
-            )
-
-            # ------------------------------------------------
-            # Store detailed retrieval results
-            # ------------------------------------------------
-
-            acceptable_papers = (
-                ground_truth[
-                    question_id
-                ]["acceptable_papers"]
-            )
-
-            for rank, retrieved in enumerate(
-                result["results"],
-                start=1
-            ):
+            for rank, retrieved in enumerate(evaluated["results"], start=1):
 
                 all_detailed_rows.append({
 
-                    "question_id":
-                        question_id,
-
-                    "chunk_size":
-                        chunk_size,
-
-                    "rank":
-                        rank,
-
-                    "paper_id":
-                        retrieved["paper_id"],
-
-                    "dataset":
-                        retrieved["dataset"],
-
-                    "chunk_id":
-                        retrieved["chunk_id"],
-
-                    "page_start":
-                        retrieved["page_start"],
-
-                    "page_end":
-                        retrieved["page_end"],
-
-                    "word_count":
-                        retrieved["word_count"],
-
-                    "similarity":
-                        f"{retrieved['score']:.6f}",
-
-                    "is_relevant":
-                        is_relevant(
-                            retrieved,
-                            acceptable_papers
-                        ),
-
-                    "text":
-                        retrieved["text"]
+                    "question_id": question_id,
+                    "chunk_size": chunk_size,
+                    "rank": rank,
+                    "paper_id": retrieved["paper_id"],
+                    "dataset": retrieved["dataset"],
+                    "chunk_id": retrieved["chunk_id"],
+                    "page_start": retrieved["page_start"],
+                    "page_end": retrieved["page_end"],
+                    "word_count": retrieved["word_count"],
+                    "similarity": f"{retrieved['score']:.6f}",
+                    "is_relevant_paper": evaluated["paper_fn"](retrieved),
+                    "is_relevant_page": evaluated["page_fn"](retrieved),
+                    "text": retrieved["text"]
 
                 })
 
@@ -657,161 +366,68 @@ def main():
         # Aggregate metrics
         # ----------------------------------------------------
 
-        num_questions = len(
-            questions
-        )
+        num_questions = len(per_question_metrics)
 
-        mean_recall_1 = (
-            sum(recall_1_values)
-            / num_questions
-        )
-
-        mean_recall_3 = (
-            sum(recall_3_values)
-            / num_questions
-        )
-
-        mean_recall_5 = (
-            sum(recall_5_values)
-            / num_questions
-        )
-
-        mean_mrr = (
-            sum(mrr_values)
-            / num_questions
-        )
+        def avg(key):
+            return sum(m[key] for m in per_question_metrics) / num_questions
 
         summary_row = {
-
-            "chunk_size":
-                chunk_size,
-
-            "num_questions":
-                num_questions,
-
-            "recall_at_1":
-                f"{mean_recall_1:.4f}",
-
-            "recall_at_3":
-                f"{mean_recall_3:.4f}",
-
-            "recall_at_5":
-                f"{mean_recall_5:.4f}",
-
-            "mrr":
-                f"{mean_mrr:.4f}"
-
+            "chunk_size": chunk_size,
+            "num_questions": num_questions,
+            "recall_at_1_paper": f"{avg('recall_at_1_paper'):.4f}",
+            "recall_at_1_page": f"{avg('recall_at_1_page'):.4f}",
+            "recall_at_3_paper": f"{avg('recall_at_3_paper'):.4f}",
+            "recall_at_3_page": f"{avg('recall_at_3_page'):.4f}",
+            "recall_at_5_paper": f"{avg('recall_at_5_paper'):.4f}",
+            "recall_at_5_page": f"{avg('recall_at_5_page'):.4f}",
+            "mrr_paper": f"{avg('mrr_paper'):.4f}",
+            "mrr_page": f"{avg('mrr_page'):.4f}",
         }
 
-        all_summary_rows.append(
-            summary_row
-        )
+        all_summary_rows.append(summary_row)
 
-        # ----------------------------------------------------
-        # Print aggregate results
-        # ----------------------------------------------------
-
-        print(
-            "\n"
-            + "-" * 80
-        )
-
-        print(
-            f"SUMMARY — "
-            f"{chunk_size}-WORD CHUNKS"
-        )
-
-        print(
-            "-" * 80
-        )
-
-        print(
-            f"Recall@1: "
-            f"{mean_recall_1:.4f}"
-        )
-
-        print(
-            f"Recall@3: "
-            f"{mean_recall_3:.4f}"
-        )
-
-        print(
-            f"Recall@5: "
-            f"{mean_recall_5:.4f}"
-        )
-
-        print(
-            f"MRR: "
-            f"{mean_mrr:.4f}"
-        )
+        print("\n" + "-" * 80)
+        print(f"SUMMARY — {chunk_size}-WORD CHUNKS")
+        print("-" * 80)
+        print(f"Recall@1: paper={summary_row['recall_at_1_paper']}  page={summary_row['recall_at_1_page']}")
+        print(f"Recall@3: paper={summary_row['recall_at_3_paper']}  page={summary_row['recall_at_3_page']}")
+        print(f"Recall@5: paper={summary_row['recall_at_5_paper']}  page={summary_row['recall_at_5_page']}")
+        print(f"MRR:      paper={summary_row['mrr_paper']}  page={summary_row['mrr_page']}")
 
     # ========================================================
     # Save results
     # ========================================================
 
-    save_detailed_results(
-        all_detailed_rows
-    )
-
-    save_summary_results(
-        all_summary_rows
-    )
+    save_detailed_results(all_detailed_rows)
+    save_summary_results(all_summary_rows)
 
     # ========================================================
     # Final comparison
     # ========================================================
 
-    print(
-        "\n"
-        + "=" * 80
-    )
+    print("\n" + "=" * 80)
+    print("FINAL CHUNK-SIZE COMPARISON (paper-level / page-aware)")
+    print("=" * 80)
 
     print(
-        "FINAL CHUNK-SIZE COMPARISON"
+        "\nChunk Size | Recall@1 (p/pg) | Recall@3 (p/pg) | "
+        "Recall@5 (p/pg) | MRR (p/pg)"
     )
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        "\nChunk Size | Recall@1 | Recall@3 | "
-        "Recall@5 | MRR"
-    )
-
-    print(
-        "-" * 65
-    )
+    print("-" * 90)
 
     for row in all_summary_rows:
 
         print(
             f"{row['chunk_size']:>10} | "
-            f"{row['recall_at_1']:>8} | "
-            f"{row['recall_at_3']:>8} | "
-            f"{row['recall_at_5']:>8} | "
-            f"{row['mrr']:>7}"
+            f"{row['recall_at_1_paper']}/{row['recall_at_1_page']} | "
+            f"{row['recall_at_3_paper']}/{row['recall_at_3_page']} | "
+            f"{row['recall_at_5_paper']}/{row['recall_at_5_page']} | "
+            f"{row['mrr_paper']}/{row['mrr_page']}"
         )
 
-    print(
-        "\nDetailed results saved to:"
-    )
-
-    print(
-        f"  {DETAILED_RESULTS_FILE}"
-    )
-
-    print(
-        "\nSummary results saved to:"
-    )
-
-    print(
-        f"  {SUMMARY_RESULTS_FILE}"
-    )
-
-    print(
-        "\nEvaluation completed successfully!"
-    )
+    print(f"\nDetailed results saved to:\n  {DETAILED_RESULTS_FILE}")
+    print(f"\nSummary results saved to:\n  {SUMMARY_RESULTS_FILE}")
+    print("\nEvaluation completed successfully!")
 
 
 # ============================================================
@@ -819,5 +435,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
